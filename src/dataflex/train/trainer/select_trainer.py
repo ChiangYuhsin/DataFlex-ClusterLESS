@@ -257,6 +257,46 @@ class SelectTrainer(CustomSeq2SeqTrainer):
         logger.info(f"[SelectTrainer] selector={name}, params={sel_params}")
         logger.info("[Dataflex] SelectTrainer initialized")
 
+    def _sanitize_selected_indices(
+        self,
+        indices: Optional[List[int]],
+        target_num_samples: Optional[int] = None,
+        seed_offset: int = 0,
+        context: str = "selection",
+    ) -> List[int]:
+        """Keep dynamic selections valid after tokenizer-side dataset filtering."""
+        if indices is None:
+            indices = []
+
+        dataset_size = len(self.train_dataset)
+        target = len(indices) if target_num_samples is None else min(int(target_num_samples), dataset_size)
+        valid, seen = [], set()
+        invalid_count = 0
+
+        for idx in indices:
+            idx = int(idx)
+            if 0 <= idx < dataset_size:
+                if idx not in seen:
+                    valid.append(idx)
+                    seen.add(idx)
+            else:
+                invalid_count += 1
+
+        duplicate_count = len(indices) - invalid_count - len(valid)
+        if len(valid) < target:
+            rng = random.Random(int(self.args.seed) + int(seed_offset))
+            candidates = [idx for idx in range(dataset_size) if idx not in seen]
+            rng.shuffle(candidates)
+            valid.extend(candidates[: target - len(valid)])
+
+        if self.accelerator.is_main_process and (invalid_count or duplicate_count or len(valid) != len(indices)):
+            logger.warning(
+                f"[Dataflex] Sanitized {context} indices: input={len(indices)}, output={len(valid)}, "
+                f"dataset_size={dataset_size}, invalid={invalid_count}, duplicates={duplicate_count}."
+            )
+
+        return valid
+
     @override
     def _get_train_sampler(self, train_dataset) -> Optional[torch.utils.data.Sampler]:
         if self.finetuning_args.disable_shuffling:
@@ -369,6 +409,12 @@ class SelectTrainer(CustomSeq2SeqTrainer):
 
         logger.info(f"[Dataflex] Warmup step {self.finetuning_args.warmup_step}, warmup samples: {total_warmup_samples} in total")
         warmup_indices = self.selector.warmup(total_warmup_samples, replacement=True)
+        warmup_indices = self._sanitize_selected_indices(
+            warmup_indices,
+            target_num_samples=total_warmup_samples,
+            seed_offset=0,
+            context="warmup",
+        )
         train_dataloader = self.get_train_dataloader(warmup_indices)
 
         if self.is_fsdp_xla_v2_enabled:
@@ -770,6 +816,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                             scheduler_state=self.lr_scheduler.state_dict(),
                             current_update_times=current_update_times,
                             update_times=self.finetuning_args.update_times,
+                            update_step=self.finetuning_args.update_step,
                             tokenizer=self.tokenizer,
                         )
                         new_indices = self.selector.select(
@@ -777,6 +824,12 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                             step_id=self.state.global_step,
                             num_samples=total_train_batch_size * self.finetuning_args.update_step,
                             **extra_args
+                        )
+                        new_indices = self._sanitize_selected_indices(
+                            new_indices,
+                            target_num_samples=total_train_batch_size * self.finetuning_args.update_step,
+                            seed_offset=self.state.global_step,
+                            context=f"step {self.state.global_step}",
                         )
 
                         # 每个进程根据 local_indices 构造 dataloader

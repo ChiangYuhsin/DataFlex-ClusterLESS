@@ -27,31 +27,6 @@ def _move_to_device(batch, device):
     return batch
 
 
-@register_selector("cluster_less_smoke")
-@register_selector("cluster_less_rep_mixed")
-@register_selector("cluster_less_rep_farthest")
-@register_selector("cluster_less_rep_nearest")
-@register_selector("cluster_less_rep_random")
-@register_selector("cluster_less_spc16")
-@register_selector("cluster_less_spc12")
-@register_selector("cluster_less_spc10")
-@register_selector("cluster_less_spc8")
-@register_selector("cluster_less_spc7")
-@register_selector("cluster_less_spc6")
-@register_selector("cluster_less_spc5")
-@register_selector("cluster_less_spc4")
-@register_selector("cluster_less_spc3")
-@register_selector("cluster_less_spc2")
-@register_selector("cluster_less_spc1")
-@register_selector("cluster_less_random_partition")
-@register_selector("cluster_less_random")
-@register_selector("cluster_less_random_projection_lsh")
-@register_selector("cluster_less_lsh")
-@register_selector("cluster_less_farthest_first")
-@register_selector("cluster_less_farthest")
-@register_selector("cluster_less_spherical_kmeans")
-@register_selector("cluster_less_spherical")
-@register_selector("cluster_less_kmeans")
 @register_selector("cluster_less")
 class ClusterLessSelector(LessSelector):
     """
@@ -83,6 +58,7 @@ class ClusterLessSelector(LessSelector):
         clustering_method: str = "kmeans",
         representative_strategy: str = "random",
         lsh_num_bits: Optional[int] = None,
+        cluster_update_interval: int = 1,
     ):
         super().__init__(
             dataset=dataset,
@@ -104,6 +80,20 @@ class ClusterLessSelector(LessSelector):
         self.clustering_method = clustering_method
         self.representative_strategy = representative_strategy
         self.lsh_num_bits = lsh_num_bits
+        self.cluster_update_interval = max(1, int(cluster_update_interval))
+
+    def _resolve_cluster_step(self, step_id: int, **kwargs) -> int:
+        """Return the cached clustering step to use for this dynamic update."""
+        if self.cluster_update_interval <= 1:
+            return int(step_id)
+
+        current_update = int(kwargs.get("current_update_times", 1) or 1)
+        update_step = int(kwargs.get("update_step", 0) or 0)
+        if current_update <= 1 or update_step <= 0:
+            return int(step_id)
+
+        offset_updates = (current_update - 1) % self.cluster_update_interval
+        return int(step_id) - offset_updates * update_step
 
     def _extract_embedding_features(self, model, step_id: int) -> torch.Tensor:
         feature_path = os.path.join(self.cache_dir, "cluster", str(step_id), "train_embeddings.pt")
@@ -183,14 +173,17 @@ class ClusterLessSelector(LessSelector):
         spherical: bool = False,
     ) -> torch.Tensor:
         assignments = []
+        center_norms = None
+        if not spherical:
+            center_norms = centers.pow(2).sum(dim=1).unsqueeze(0)
         for start in range(0, len(features), self.assignment_chunk_size):
             chunk = features[start:start + self.assignment_chunk_size]
             if spherical:
                 similarities = chunk @ centers.T
                 assignments.append(similarities.argmax(dim=1))
             else:
-                distances = torch.cdist(chunk, centers)
-                assignments.append(distances.argmin(dim=1))
+                scores = 2.0 * (chunk @ centers.T) - center_norms
+                assignments.append(scores.argmax(dim=1))
         return torch.cat(assignments, dim=0)
 
     def _run_lloyd_kmeans(self, features: torch.Tensor, step_id: int, spherical: bool) -> torch.Tensor:
@@ -333,7 +326,7 @@ class ClusterLessSelector(LessSelector):
 
         member_features = features[members]
         centroid = member_features.mean(dim=0, keepdim=True)
-        distances = torch.cdist(member_features, centroid).squeeze(1)
+        distances = (member_features - centroid).pow(2).sum(dim=1)
 
         if strategy in {"nearest", "nearest_to_centroid", "center", "centroid"}:
             order = torch.argsort(distances, descending=False)
@@ -352,7 +345,6 @@ class ClusterLessSelector(LessSelector):
                         seen.add(idx)
                         merged.append(idx)
             return members[torch.tensor(merged, dtype=torch.long)]
-
         raise ValueError(f"Unknown representative_strategy: {self.representative_strategy}")
 
     def _sample_representatives(
@@ -389,11 +381,14 @@ class ClusterLessSelector(LessSelector):
             return obj[0] or []
 
         select_started = time.perf_counter()
-        cluster_ids, timing = self._get_or_create_clusters(model, step_id)
+        cluster_step_id = self._resolve_cluster_step(step_id, **kwargs)
+        cluster_ids, timing = self._get_or_create_clusters(model, cluster_step_id)
+        timing["cluster_step_id"] = int(cluster_step_id)
+        timing["cluster_update_interval"] = int(self.cluster_update_interval)
         features = None
         if self.representative_strategy.lower() not in {"random", "rand"}:
             started = time.perf_counter()
-            features = self._extract_embedding_features(model, step_id)
+            features = self._extract_embedding_features(model, cluster_step_id)
             timing["representative_feature_load_time_sec"] = time.perf_counter() - started
         else:
             timing["representative_feature_load_time_sec"] = 0.0
@@ -445,6 +440,15 @@ class ClusterLessSelector(LessSelector):
             num_clusters = int(cluster_ids.max().item()) + 1
             cluster_grads = torch.zeros(num_clusters, self.proj_dim, dtype=torch.float32)
             cluster_counts = torch.zeros(num_clusters, 1, dtype=torch.float32)
+            if rep_projected_grads.shape[0] != len(representatives):
+                aligned_count = min(rep_projected_grads.shape[0], len(representatives))
+                logger.warning(
+                    "[ClusterLessSelector] Representative gradient count mismatch: "
+                    f"got {rep_projected_grads.shape[0]} gradients for {len(representatives)} "
+                    f"representatives. Aligning to first {aligned_count} rows."
+                )
+                rep_projected_grads = rep_projected_grads[:aligned_count]
+                representatives = representatives[:aligned_count]
             rep_clusters = cluster_ids[torch.tensor(representatives, dtype=torch.long)]
             cluster_grads.index_add_(0, rep_clusters, rep_projected_grads)
             cluster_counts.index_add_(0, rep_clusters, torch.ones(len(representatives), 1))
@@ -465,6 +469,8 @@ class ClusterLessSelector(LessSelector):
                 "samples_per_cluster": int(self.samples_per_cluster),
                 "clustering_method": self.clustering_method,
                 "representative_strategy": self.representative_strategy,
+                "cluster_update_interval": int(self.cluster_update_interval),
+                "cluster_step_id": int(cluster_step_id),
                 "timing": timing,
             }
             save_selection(save_path, selected_indices, metric_payload, self.accelerator)
